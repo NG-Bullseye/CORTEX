@@ -1,0 +1,1386 @@
+esphome:
+  name: cyd-panel
+  friendly_name: "Nabu Terminal"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: DEBUG
+
+wifi:
+  ssid: !env_var ESPHOME_WIFI_SSID
+  password: !env_var ESPHOME_WIFI_PASSWORD
+  manual_ip:
+    static_ip: 192.168.1.240
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Web server for direct HTTP access (MCP endpoint)
+web_server:
+  port: 80
+
+# ── HTTP Request (HA API calls) ─────────────────────────
+http_request:
+  id: http_request_component
+  useragent: esphome/cyd-panel
+  timeout: 3s
+
+# ── SPI Buses ──────────────────────────────────────────
+spi:
+  - id: tft
+    clk_pin: 14
+    mosi_pin: 13
+    miso_pin:
+      number: 12
+      ignore_strapping_warning: true
+  - id: touch
+    clk_pin: 25
+    mosi_pin: 32
+    miso_pin: 39
+
+# ── Outputs ────────────────────────────────────────────
+output:
+  - id: backlight_pwm
+    platform: ledc
+    pin: 21
+  - id: led_red
+    platform: ledc
+    pin: 4
+    inverted: true
+  - id: led_green
+    platform: ledc
+    pin: 16
+    inverted: true
+  - id: led_blue
+    platform: ledc
+    pin: 17
+    inverted: true
+
+light:
+  - id: backlight
+    platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    restore_mode: ALWAYS_ON
+  - id: status_led
+    platform: rgb
+    red: led_red
+    green: led_green
+    blue: led_blue
+    name: "Status LED"
+    restore_mode: ALWAYS_OFF
+
+# ── Display ────────────────────────────────────────────
+display:
+  - id: main_display
+    platform: ili9xxx
+    model: ILI9341
+    spi_id: tft
+    cs_pin:
+      number: 15
+      ignore_strapping_warning: true
+    dc_pin:
+      number: 2
+      ignore_strapping_warning: true
+    invert_colors: false
+    transform:
+      swap_xy: true
+      mirror_x: true
+      mirror_y: true
+    dimensions:
+      width: 320
+      height: 240
+    update_interval: never
+    auto_clear_enabled: false
+
+# ── Touchscreen ────────────────────────────────────────
+touchscreen:
+  - id: main_touch
+    platform: xpt2046
+    spi_id: touch
+    cs_pin: 33
+    # interrupt_pin entfernt - erzwingt Polling-Modus (kein SPI-Read wenn IRQ nicht LOW)
+    threshold: 1000
+    on_touch:
+      then:
+        - globals.set:
+            id: last_touch_x
+            value: !lambda 'return touch.x;'
+        - globals.set:
+            id: last_touch_y
+            value: !lambda 'return touch.y;'
+        - logger.log:
+            format: "TOUCH: x=%d y=%d (raw_x=%d raw_y=%d)"
+            args: [touch.x, touch.y, touch.x_raw, touch.y_raw]
+        - lvgl.label.update:
+            id: lbl_dev_coords
+            text: !lambda |-
+              char buf[32];
+              snprintf(buf, sizeof(buf), "LAST: x=%-4d y=%-4d", touch.x, touch.y);
+              return std::string(buf);
+    calibration:
+      x_min: 280
+      x_max: 3860
+      y_min: 340
+      y_max: 3860
+    transform:
+      swap_xy: true
+      mirror_x: true
+      mirror_y: true
+
+# Diagnose: IRQ-Pin GPIO36 überwachen
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: 36
+      mode: INPUT
+    name: "Touch IRQ"
+    id: touch_irq
+    filters:
+      - delayed_on: 0ms
+    on_press:
+      - logger.log: "IRQ36: LOW (touch detected by hardware)"
+    on_release:
+      - logger.log: "IRQ36: HIGH (released)"
+
+# ── Globals ────────────────────────────────────────────
+globals:
+  - id: last_touch_x
+    type: int
+    initial_value: '0'
+  - id: last_touch_y
+    type: int
+    initial_value: '0'
+  # Feed button IDs stored for click handler callback
+  - id: feed_btn_ids
+    type: std::vector<std::string>
+    initial_value: 'std::vector<std::string>()'
+  # Pending fix: when user taps a bug button, store ID here for the interval to POST
+  - id: pending_fix_id
+    type: std::string
+    initial_value: '""'
+
+# ── Sensors ────────────────────────────────────────────
+sensor:
+  - platform: adc
+    pin: 34
+    name: "Ambient Light"
+    id: ambient_light
+    update_interval: 30s
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_rssi
+    update_interval: 60s
+  - platform: uptime
+    name: "Uptime"
+    id: uptime_sec
+
+# ── Text Sensors (HA → Display) ───────────────────────
+
+# Nabu Kommunikationskanal: HA/MCP setzt diesen Text
+text_sensor:
+  - platform: template
+    name: "Nabu Message"
+    id: nabu_message
+    update_interval: never
+    lambda: 'return {"SYSTEMS NOMINAL"};'
+  - platform: template
+    name: "Watchdog Alert"
+    id: watchdog_alert
+    update_interval: never
+    lambda: 'return {"NO ALERTS"};'
+  - platform: template
+    name: "Room Zone"
+    id: room_zone
+    update_interval: never
+    lambda: 'return {"--"};'
+  - platform: homeassistant
+    name: "HA Zone"
+    id: ha_zone
+    entity_id: sensor.room_zone
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_zone
+            text: !lambda 'return ("ZONE: " + x).c_str();'
+  - platform: homeassistant
+    name: "Management Message"
+    id: mgmt_message
+    entity_id: input_text.management_message
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_nabu_msg
+            text: !lambda 'return x.c_str();'
+
+  # ── Slot State Streams (HA → Button color) ──
+  - platform: homeassistant
+    name: "Slot3 BLACKOUT state"
+    id: slot3_state
+    entity_id: input_boolean.nabu_blackout
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x == "on";'
+            then:
+              - lvgl.obj.update:
+                  id: btn_slot3
+                  bg_color: 0x2a1a00
+                  border_color: 0xff8800
+                  clickable: true
+            else:
+              - if:
+                  condition:
+                    lambda: 'return x == "unavailable" || x.empty();'
+                  then:
+                    - lvgl.obj.update:
+                        id: btn_slot3
+                        bg_color: 0x1a0808
+                        border_color: 0x440000
+                        clickable: false
+                  else:
+                    - lvgl.obj.update:
+                        id: btn_slot3
+                        bg_color: 0x0d1b2a
+                        border_color: 0x1b4965
+                        clickable: true
+
+  - platform: homeassistant
+    name: "Slot4 REBOUND state"
+    id: slot4_state
+    entity_id: input_boolean.nabu_rebound
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x == "on";'
+            then:
+              - lvgl.obj.update:
+                  id: btn_slot4
+                  bg_color: 0x0a2a0a
+                  border_color: 0x00ff44
+            else:
+              - lvgl.obj.update:
+                  id: btn_slot4
+                  bg_color: 0x0a0a1a
+                  border_color: 0x1a1a3a
+
+# ── Time ───────────────────────────────────────────────
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      then:
+        - lvgl.label.update:
+            id: lbl_clock
+            text: !lambda |-
+              auto now = id(ha_time).now();
+              char buf[6];
+              snprintf(buf, sizeof(buf), "%02d:%02d", now.hour, now.minute);
+              return std::string(buf);
+    on_time:
+      - seconds: 0
+        then:
+          - lvgl.label.update:
+              id: lbl_clock
+              text: !lambda |-
+                auto now = id(ha_time).now();
+                char buf[6];
+                snprintf(buf, sizeof(buf), "%02d:%02d", now.hour, now.minute);
+                return std::string(buf);
+
+# ── Fonts ──────────────────────────────────────────────
+# ── Feed Polling + Fix Dispatch ────────────────────────
+interval:
+  # Dispatch pending fix requests (from button taps)
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(pending_fix_id).empty()) return;
+          // Will be picked up by the http_request below
+      - if:
+          condition:
+            lambda: 'return !id(pending_fix_id).empty();'
+          then:
+            - http_request.post:
+                url: "http://192.168.1.225:8900/api/feed/fix"
+                json: |-
+                  root["id"] = id(pending_fix_id);
+                on_response:
+                  - lambda: |-
+                      id(pending_fix_id) = "";
+  # Poll feed data
+  - interval: 30s
+    then:
+      - http_request.get:
+          url: "http://192.168.1.225:8900/api/feed"
+          capture_response: true
+          max_response_buffer_size: 4096
+          on_response:
+            - lambda: |-
+                if (response->status_code != 200 || body.empty()) return;
+
+                auto extract = [](const std::string &obj, const char* key) -> std::string {
+                  std::string needle = std::string("\"") + key + "\":\"";
+                  size_t p = obj.find(needle);
+                  if (p == std::string::npos) return "";
+                  p += needle.size();
+                  size_t e = obj.find('"', p);
+                  return (e != std::string::npos) ? obj.substr(p, e - p) : "";
+                };
+
+                // Update main page summary from first feed entry
+                size_t tpos = body.find("\"text\":\"");
+                if (tpos != std::string::npos) {
+                  tpos += 8;
+                  size_t te = tpos;
+                  while (te < body.size() && !(body[te] == '"' && body[te-1] != '\\')) te++;
+                  std::string raw = body.substr(tpos, te - tpos);
+                  std::string txt;
+                  for (size_t i = 0; i < raw.size(); i++) {
+                    if (raw[i] == '\\' && i+1 < raw.size() && raw[i+1] == 'n') { txt += '\n'; i++; }
+                    else txt += raw[i];
+                  }
+                  size_t nl = txt.find('\n');
+                  lv_label_set_text(id(lbl_nabu_msg), (nl != std::string::npos ? txt.substr(0, nl) : txt).c_str());
+                }
+
+                // Clear container and rebuild from feed items
+                lv_obj_t* cont = id(feed_btn_container);
+                lv_obj_clean(cont);
+                id(feed_btn_ids).clear();
+
+                size_t fpos = body.find("\"feed\":");
+                if (fpos == std::string::npos) return;
+                size_t arr_start = body.find('[', fpos);
+                if (arr_start == std::string::npos) return;
+
+                size_t cursor = arr_start;
+                int idx = 0;
+                while (idx < 15) {
+                  size_t obj_start = body.find('{', cursor);
+                  if (obj_start == std::string::npos) break;
+                  size_t obj_end = body.find('}', obj_start);
+                  if (obj_end == std::string::npos) break;
+                  std::string obj = body.substr(obj_start, obj_end - obj_start + 1);
+                  cursor = obj_end + 1;
+
+                  std::string eid = extract(obj, "id");
+                  std::string msg = extract(obj, "msg");
+                  bool fixable = obj.find("\"fixable\":true") != std::string::npos
+                              || obj.find("\"fixable\": true") != std::string::npos;
+                  if (msg.empty()) continue;
+
+                  if (fixable && !eid.empty()) {
+                    // Tappable bug button (red/amber style)
+                    lv_obj_t* btn = lv_btn_create(cont);
+                    lv_obj_set_width(btn, 296);
+                    lv_obj_set_height(btn, LV_SIZE_CONTENT);
+                    lv_obj_set_style_bg_color(btn, lv_color_hex(0x1a0a0a), 0);
+                    lv_obj_set_style_border_color(btn, lv_color_hex(0xe94560), 0);
+                    lv_obj_set_style_border_width(btn, 1, 0);
+                    lv_obj_set_style_radius(btn, 2, 0);
+                    lv_obj_set_style_pad_all(btn, 4, 0);
+                    // Pressed state
+                    lv_obj_set_style_bg_color(btn, lv_color_hex(0x3a1a1a), LV_STATE_PRESSED);
+
+                    lv_obj_t* lbl = lv_label_create(btn);
+                    lv_label_set_text(lbl, msg.c_str());
+                    lv_obj_set_style_text_font(lbl, id(font_mono_12), 0);
+                    lv_obj_set_style_text_color(lbl, lv_color_hex(0xe94560), 0);
+                    lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+                    lv_obj_set_width(lbl, 280);
+
+                    // Store index and ID for click handler
+                    int btn_idx = id(feed_btn_ids).size();
+                    id(feed_btn_ids).push_back(eid);
+                    lv_obj_set_user_data(btn, (void*)(intptr_t)btn_idx);
+
+                    // Click callback: POST /api/feed/fix with the stored ID
+                    lv_obj_add_event_cb(btn, [](lv_event_t* e) {
+                      lv_obj_t* target = lv_event_get_target(e);
+                      int i = (int)(intptr_t)lv_obj_get_user_data(target);
+                      auto& ids = id(feed_btn_ids);
+                      if (i < 0 || i >= (int)ids.size()) return;
+                      // Visual feedback
+                      lv_obj_t* child = lv_obj_get_child(target, 0);
+                      if (child) lv_label_set_text(child, "FIXING...");
+                      lv_obj_set_style_border_color(target, lv_color_hex(0x446688), 0);
+                      // Store ID for interval-based HTTP POST
+                      id(pending_fix_id) = ids[i];
+                    }, LV_EVENT_CLICKED, NULL);
+                  } else {
+                    // Info label (not tappable)
+                    lv_obj_t* lbl = lv_label_create(cont);
+                    lv_label_set_text(lbl, msg.c_str());
+                    lv_obj_set_style_text_font(lbl, id(font_mono_12), 0);
+                    lv_obj_set_style_text_color(lbl, lv_color_hex(0x00ff88), 0);
+                    lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+                    lv_obj_set_width(lbl, 296);
+                    lv_obj_set_style_pad_ver(lbl, 2, 0);
+                  }
+                  idx++;
+                }
+
+                // Timestamp
+                auto now = id(ha_time).now();
+                if (now.is_valid()) {
+                  char tsbuf[8];
+                  snprintf(tsbuf, sizeof(tsbuf), "%02d:%02d", now.hour, now.minute);
+                  lv_label_set_text(id(lbl_feed_updated), tsbuf);
+                }
+
+font:
+  - file: "gfonts://Share Tech Mono"
+    id: font_mono_24
+    size: 24
+    glyphs: "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ ÄÖÜäöüß"
+  - file: "gfonts://Share Tech Mono"
+    id: font_mono_16
+    size: 16
+    glyphs: "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ ÄÖÜäöüß"
+  - file: "gfonts://Share Tech Mono"
+    id: font_mono_12
+    size: 12
+    glyphs: "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ ÄÖÜäöüß"
+  - file: "gfonts://Orbitron"
+    id: font_header
+    size: 18
+    glyphs: "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]_abcdefghijklmnopqrstuvwxyz~ ÄÖÜäöüß"
+
+# ── LVGL ───────────────────────────────────────────────
+lvgl:
+  displays: main_display
+  touchscreens: main_touch
+  buffer_size: 25%
+  default_font: font_mono_12
+
+  style_definitions:
+    # Deep space background
+    - id: style_space
+      bg_color: 0x0a0a1a
+      bg_opa: COVER
+      text_color: 0x00ff88
+
+    # Header bar
+    - id: style_header
+      bg_color: 0x0f1a3e
+      bg_opa: COVER
+      text_color: 0x00ccff
+      border_color: 0x00ccff
+      border_width: 1
+      border_side: BOTTOM
+      pad_all: 4
+
+    # Script button (Star Wars panel style)
+    - id: style_btn
+      bg_color: 0x0d1b2a
+      bg_opa: COVER
+      text_color: 0x00ff88
+      border_color: 0x1b4965
+      border_width: 2
+      radius: 2
+      pad_all: 4
+      shadow_color: 0x00ff88
+      shadow_opa: 30%
+      shadow_spread: 1
+      shadow_width: 6
+
+    # Button pressed
+    - id: style_btn_pressed
+      bg_color: 0x1b4965
+      text_color: 0x00ffcc
+      border_color: 0x00ff88
+      shadow_opa: 60%
+
+    # Alert style (red)
+    - id: style_alert
+      bg_color: 0x1a0a0a
+      bg_opa: COVER
+      text_color: 0xe94560
+      border_color: 0xe94560
+      border_width: 1
+      radius: 2
+      pad_all: 6
+
+    # Feed panel
+    - id: style_feed
+      bg_color: 0x0a0f1a
+      bg_opa: COVER
+      text_color: 0x00ff88
+      border_color: 0x1b4965
+      border_width: 1
+      radius: 2
+      pad_all: 6
+
+    # Nav button
+    - id: style_nav
+      bg_color: 0x0f1a3e
+      bg_opa: COVER
+      text_color: 0x00ccff
+      border_color: 0x00ccff
+      border_width: 1
+      radius: 0
+      pad_all: 4
+
+    # Nav active
+    - id: style_nav_active
+      bg_color: 0x1b4965
+      text_color: 0x00ffcc
+      border_color: 0x00ff88
+
+  pages:
+    # ═══════════════════════════════════════════════════
+    # PAGE 1: MAIN - Scripts + Status
+    # ═══════════════════════════════════════════════════
+    - id: page_main
+      bg_color: 0x0a0a1a
+      widgets:
+        # ── Top header bar ──
+        - obj:
+            styles: style_header
+            width: 320
+            height: 28
+            x: 0
+            y: 0
+            widgets:
+              - label:
+                  id: lbl_clock
+                  text: "--:--"
+                  text_font: font_mono_16
+                  align: LEFT_MID
+                  x: 4
+              - label:
+                  text: "NABU"
+                  text_font: font_header
+                  text_color: 0xe94560
+                  align: CENTER
+              - label:
+                  id: lbl_zone
+                  text: "ZONE: --"
+                  text_font: font_mono_12
+                  align: RIGHT_MID
+                  x: -4
+
+        # ── Slot Buttons Grid (5 slots, state-driven) ──
+        - obj:
+            width: 310
+            height: 155
+            x: 5
+            y: 30
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            layout:
+              type: FLEX
+              flex_flow: ROW_WRAP
+              flex_align_main: SPACE_EVENLY
+              flex_align_cross: START
+              pad_column: 6
+              pad_row: 6
+            widgets:
+              # Slot 1: LICHT (stateless action)
+              - button:
+                  id: btn_slot1
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 148
+                  height: 52
+                  widgets:
+                    - label:
+                        text: "LICHT"
+                        text_font: font_mono_16
+                        align: CENTER
+                  on_release:
+                    - logger.log: "SLOT1: LICHT"
+                    - http_request.post:
+                        url: "http://192.168.1.225:8123/api/services/script/turn_on"
+                        request_headers:
+                          Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIyYmJhNmExYjVhZGM0OWRiYjgyNjdiMGE3NzAxYTM0MSIsImlhdCI6MTc1ODM4MDI3NywiZXhwIjoyMDczNzQwMjc3fQ.DotVSr2qMp6PZQJA5nvjNtMSwT49hk921KzyrM2AfmU"
+                          Content-Type: "application/json"
+                        body: '{"entity_id":"script.helles_licht_override"}'
+
+              # Slot 2: NABU (toggle automation, state-driven)
+              - button:
+                  id: btn_slot2
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 148
+                  height: 52
+                  widgets:
+                    - label:
+                        text: "NABU"
+                        text_font: font_mono_16
+                        align: CENTER
+                  on_release:
+                    - logger.log: "SLOT2: NABU apply current slot"
+                    - homeassistant.service:
+                        service: rest_command.nabu_apply_current_slot
+
+              # Slot 3: BLACKOUT (toggle input_boolean, state-driven, amber when ON)
+              - button:
+                  id: btn_slot3
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 148
+                  height: 52
+                  widgets:
+                    - label:
+                        text: "BLACKOUT"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - logger.log: "SLOT3: BLACKOUT toggle"
+                    - homeassistant.service:
+                        service: input_boolean.toggle
+                        data:
+                          entity_id: input_boolean.nabu_blackout
+
+              # Slot 4: REBOUND (toggle input_boolean, state-driven)
+              - button:
+                  id: btn_slot4
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 148
+                  height: 52
+                  widgets:
+                    - label:
+                        text: "REBOUND"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - logger.log: "SLOT4: REBOUND toggle"
+                    - homeassistant.service:
+                        service: input_boolean.toggle
+                        data:
+                          entity_id: input_boolean.nabu_rebound
+
+              # Slot 5: THINK (stateless action, full width)
+              - button:
+                  id: btn_slot5
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 302
+                  height: 36
+                  widgets:
+                    - label:
+                        text: ">> THINK <<"
+                        text_font: font_mono_12
+                        text_color: 0x00ccff
+                        align: CENTER
+                  on_release:
+                    - logger.log: "SLOT5: THINK"
+                    - homeassistant.service:
+                        service: script.turn_on
+                        data:
+                          entity_id: script.nabu_think
+
+        # ── Nabu Message Feed (bottom) ──
+        - obj:
+            styles: style_feed
+            width: 310
+            height: 42
+            x: 5
+            y: 168
+            widgets:
+              - label:
+                  text: ">"
+                  text_font: font_mono_12
+                  text_color: 0x1b4965
+                  x: 0
+                  y: 0
+              - label:
+                  id: lbl_nabu_msg
+                  text: "SYSTEMS NOMINAL"
+                  text_font: font_mono_12
+                  text_color: 0x00ff88
+                  x: 12
+                  y: 0
+                  width: 280
+                  text_align: LEFT
+                  long_mode: WRAP
+              - label:
+                  id: lbl_watchdog
+                  text: ""
+                  text_font: font_mono_12
+                  text_color: 0xe94560
+                  x: 12
+                  y: 16
+                  width: 280
+                  text_align: LEFT
+                  long_mode: SCROLL_CIRCULAR
+
+        # ── Bottom nav bar ──
+        - obj:
+            width: 320
+            height: 24
+            x: 0
+            y: 214
+            bg_color: 0x0f1a3e
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: SPACE_EVENLY
+            widgets:
+              - button:
+                  styles: style_nav_active
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "CTRL"
+                        text_font: font_mono_12
+                        align: CENTER
+
+              - button:
+                  id: nav_feed
+                  styles: style_nav
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "FEED"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - lvgl.page.show: page_feed
+
+              - button:
+                  id: nav_musik
+                  styles: style_nav
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "AUDIO"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - lvgl.page.show: page_audio
+
+              - button:
+                  id: nav_dev
+                  styles: style_nav
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "DEV"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - lvgl.page.show: page_dev
+
+    # ═══════════════════════════════════════════════════
+    # PAGE 2: FEED - Watchdog + Nabu Comms
+    # ═══════════════════════════════════════════════════
+    - id: page_feed
+      bg_color: 0x0a0a1a
+      widgets:
+        - obj:
+            styles: style_header
+            width: 320
+            height: 28
+            x: 0
+            y: 0
+            widgets:
+              - label:
+                  text: "SYSTEM FEED"
+                  text_font: font_mono_16
+                  text_color: 0x00ccff
+                  align: LEFT_MID
+                  x: 8
+              - label:
+                  id: lbl_feed_updated
+                  text: "--:--"
+                  text_font: font_mono_12
+                  text_color: 0x446688
+                  align: RIGHT_MID
+                  x: -8
+
+        # Dynamic bug button container (populated by feed poll lambda)
+        - obj:
+            id: feed_btn_container
+            width: 310
+            height: 180
+            x: 5
+            y: 30
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 2
+            scrollbar_mode: AUTO
+            layout:
+              type: FLEX
+              flex_flow: COLUMN
+            widgets:
+              - label:
+                  text: "> Awaiting transmissions..."
+                  text_font: font_mono_12
+                  text_color: 0x446688
+
+        # Bottom nav
+        - obj:
+            width: 320
+            height: 24
+            x: 0
+            y: 214
+            bg_color: 0x0f1a3e
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: SPACE_EVENLY
+            widgets:
+              - button:
+                  id: nav_main_2
+                  styles: style_nav
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "CTRL"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - lvgl.page.show: page_main
+
+              - button:
+                  styles: style_nav_active
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "FEED"
+                        text_font: font_mono_12
+                        align: CENTER
+
+              - button:
+                  id: nav_musik_2
+                  styles: style_nav
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "AUDIO"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - lvgl.page.show: page_audio
+
+              - button:
+                  id: nav_dev_2
+                  styles: style_nav
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "DEV"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - lvgl.page.show: page_dev
+
+    # ═══════════════════════════════════════════════════
+    # PAGE 3: AUDIO - Musik Controls
+    # ═══════════════════════════════════════════════════
+    - id: page_audio
+      bg_color: 0x0a0a1a
+      widgets:
+        - obj:
+            styles: style_header
+            width: 320
+            height: 28
+            x: 0
+            y: 0
+            widgets:
+              - label:
+                  text: "AUDIO SUBSYSTEM"
+                  text_font: font_mono_16
+                  text_color: 0x00ccff
+                  align: CENTER
+
+        # Now playing
+        - obj:
+            styles: style_feed
+            width: 310
+            height: 50
+            x: 5
+            y: 35
+            widgets:
+              - label:
+                  id: lbl_track
+                  text: "-- NO SIGNAL --"
+                  text_font: font_mono_16
+                  text_color: 0x00ff88
+                  align: TOP_LEFT
+                  width: 295
+                  long_mode: SCROLL_CIRCULAR
+              - label:
+                  id: lbl_artist
+                  text: ""
+                  text_font: font_mono_12
+                  text_color: 0x1b7070
+                  y: 25
+                  width: 295
+                  long_mode: SCROLL_CIRCULAR
+
+        # Playback controls
+        - obj:
+            width: 310
+            height: 50
+            x: 5
+            y: 88
+            bg_opa: TRANSP
+            border_width: 0
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: SPACE_EVENLY
+              flex_align_cross: CENTER
+            widgets:
+              - button:
+                  id: btn_prev
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 70
+                  height: 42
+                  widgets:
+                    - label:
+                        text: "|<<"
+                        text_font: font_mono_24
+                        align: CENTER
+                  on_release:
+                    - homeassistant.action:
+                        action: media_player.media_previous_track
+                        data:
+                          entity_id: media_player.spotifyplus_leo_nox
+
+              - button:
+                  id: btn_play
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 90
+                  height: 42
+                  widgets:
+                    - label:
+                        id: lbl_play
+                        text: "PLAY"
+                        text_font: font_mono_24
+                        align: CENTER
+                  on_release:
+                    - homeassistant.action:
+                        action: media_player.media_play_pause
+                        data:
+                          entity_id: media_player.spotifyplus_leo_nox
+
+              - button:
+                  id: btn_next
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 70
+                  height: 42
+                  widgets:
+                    - label:
+                        text: ">>|"
+                        text_font: font_mono_24
+                        align: CENTER
+                  on_release:
+                    - homeassistant.action:
+                        action: media_player.media_next_track
+                        data:
+                          entity_id: media_player.spotifyplus_leo_nox
+
+        # Volume controls
+        - obj:
+            width: 310
+            height: 40
+            x: 5
+            y: 140
+            bg_opa: TRANSP
+            border_width: 0
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: SPACE_EVENLY
+              flex_align_cross: CENTER
+            widgets:
+              - button:
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 58
+                  height: 34
+                  widgets:
+                    - label:
+                        text: "VOL-"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - homeassistant.action:
+                        action: script.tv_volume_down
+
+              - button:
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 55
+                  height: 34
+                  widgets:
+                    - label:
+                        text: "LOW"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - homeassistant.action:
+                        action: script.tv_volume_low
+
+              - button:
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 55
+                  height: 34
+                  widgets:
+                    - label:
+                        text: "MID"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - homeassistant.action:
+                        action: script.tv_volume_mid
+
+              - button:
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 55
+                  height: 34
+                  widgets:
+                    - label:
+                        text: "HIGH"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - homeassistant.action:
+                        action: script.tv_volume_high
+
+              - button:
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 60
+                  height: 34
+                  widgets:
+                    - label:
+                        text: "VOL+"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - homeassistant.action:
+                        action: script.tv_volume_up
+
+        # Device switches
+        - obj:
+            width: 310
+            height: 30
+            x: 5
+            y: 182
+            bg_opa: TRANSP
+            border_width: 0
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: SPACE_EVENLY
+            widgets:
+              - button:
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 95
+                  height: 28
+                  widgets:
+                    - label:
+                        text: "ECHO DOT"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - homeassistant.action:
+                        action: script.switch_spotify_to_echodot
+
+              - button:
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 95
+                  height: 28
+                  widgets:
+                    - label:
+                        text: "TOWER"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - homeassistant.action:
+                        action: script.switch_spotify_to_tower
+
+              - button:
+                  styles: style_btn
+                  pressed:
+                    styles: style_btn_pressed
+                  width: 95
+                  height: 28
+                  widgets:
+                    - label:
+                        text: "SPEAKER"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - homeassistant.action:
+                        action: script.switch_to_speaker_script
+
+        # Bottom nav
+        - obj:
+            width: 320
+            height: 24
+            x: 0
+            y: 214
+            bg_color: 0x0f1a3e
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: SPACE_EVENLY
+            widgets:
+              - button:
+                  id: nav_main_3
+                  styles: style_nav
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "CTRL"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - lvgl.page.show: page_main
+
+              - button:
+                  id: nav_feed_3
+                  styles: style_nav
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "FEED"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - lvgl.page.show: page_feed
+
+              - button:
+                  styles: style_nav_active
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "AUDIO"
+                        text_font: font_mono_12
+                        align: CENTER
+
+              - button:
+                  id: nav_dev_3
+                  styles: style_nav
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "DEV"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - lvgl.page.show: page_dev
+
+    # ═══════════════════════════════════════════════════
+    # PAGE 4: DEV - Touch Calibration
+    # ═══════════════════════════════════════════════════
+    - id: page_dev
+      bg_color: 0x0a0a1a
+      widgets:
+        - obj:
+            styles: style_header
+            width: 320
+            height: 28
+            x: 0
+            y: 0
+            widgets:
+              - label:
+                  text: "DEV // TOUCH CALIBRATION"
+                  text_font: font_mono_12
+                  text_color: 0x00ccff
+                  align: CENTER
+
+        # Threshold label + value
+        - label:
+            id: lbl_threshold_title
+            text: "THRESHOLD"
+            text_font: font_mono_12
+            text_color: 0x00ccff
+            x: 10
+            y: 38
+
+        - label:
+            id: lbl_threshold_val
+            text: "600"
+            text_font: font_mono_24
+            text_color: 0x00ff88
+            x: 10
+            y: 55
+
+        # Slider
+        - slider:
+            id: slider_threshold
+            x: 10
+            y: 98
+            width: 280
+            height: 20
+            min_value: 50
+            max_value: 3000
+            value: 1000
+            indicator:
+              bg_color: 0x00ff88
+            knob:
+              bg_color: 0x00ccff
+              border_color: 0x00ff88
+              border_width: 2
+            bg_color: 0x1b4965
+            on_value:
+              - lambda: 'id(main_touch).set_threshold((int)x);'
+              - lvgl.label.update:
+                  id: lbl_threshold_val
+                  text: !lambda |-
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "%d", (int)x);
+                    return std::string(buf);
+              - logger.log:
+                  format: "DEV: threshold set to %d"
+                  args: [(int)x]
+
+        # Range hints
+        - label:
+            text: "50"
+            text_font: font_mono_12
+            text_color: 0x1b4965
+            x: 10
+            y: 122
+        - label:
+            text: "3000"
+            text_font: font_mono_12
+            text_color: 0x1b4965
+            x: 270
+            y: 122
+
+        # Last touch coordinates
+        - label:
+            id: lbl_dev_coords
+            text: "LAST: x=0    y=0"
+            text_font: font_mono_12
+            text_color: 0x00ff88
+            x: 10
+            y: 148
+
+        - label:
+            text: "NOISE FLOOR ~15-35 | TOUCH ~50-100"
+            text_font: font_mono_12
+            text_color: 0x444466
+            x: 10
+            y: 168
+
+        # Bottom nav
+        - obj:
+            width: 320
+            height: 24
+            x: 0
+            y: 214
+            bg_color: 0x0f1a3e
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: SPACE_EVENLY
+            widgets:
+              - button:
+                  id: nav_main_4
+                  styles: style_nav
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "CTRL"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - lvgl.page.show: page_main
+
+              - button:
+                  id: nav_feed_4
+                  styles: style_nav
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "FEED"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - lvgl.page.show: page_feed
+
+              - button:
+                  id: nav_audio_4
+                  styles: style_nav
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "AUDIO"
+                        text_font: font_mono_12
+                        align: CENTER
+                  on_release:
+                    - lvgl.page.show: page_audio
+
+              - button:
+                  styles: style_nav_active
+                  width: 75
+                  height: 24
+                  widgets:
+                    - label:
+                        text: "DEV"
+                        text_font: font_mono_12
+                        align: CENTER
